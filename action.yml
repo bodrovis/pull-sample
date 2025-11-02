@@ -1,0 +1,375 @@
+name: 'Pull from Lokalise'
+description: GitHub action to download translation files from Lokalise TMS to your GitHub repository in the form of a pull request.
+author: 'Lokalise Group, Ilya Krukowski'
+inputs:
+  api_token:
+    description: 'API token for Lokalise with read/write permissions'
+    required: true
+  project_id:
+    description: 'Project ID for Lokalise'
+    required: true
+  base_lang:
+    description: 'Base language (e.g., en, fr_FR)'
+    required: true
+    default: 'en'
+  translations_path:
+    description: 'Paths to translation files'
+    required: true
+    default: |
+      locales
+  file_format:
+    description: 'Format of the translation files (e.g., json). Find all supported file formats at https://developers.lokalise.com/reference/api-file-formats'
+    required: true
+    default: 'json'
+  file_ext:
+    description: 'Custom file extension(s) to use when searching for translation files. You can pass either a single string (e.g. json) or multiple extensions as newline-separated values (YAML block). By default, the extension is inferred from the file_format value. However, for certain formats (e.g., json_structured) or bundles (e.g., iOS with .strings and .stringsdict), this parameter allows specifying one or more extensions manually to ensure proper file matching.'
+    required: false
+    default: ''
+  additional_params:
+    description: 'Additional parameters for Lokalise API on pull. Find all supported options at https://developers.lokalise.com/reference/download-files'
+    required: false
+    default: ''
+  temp_branch_prefix:
+    description: 'Prefix for the temp branch to create pull request'
+    required: false
+    default: 'lok'
+  always_pull_base:
+    description: 'By default, changes in the base language translation files are ignored. Set this to true to include base language translations in the PR.'
+    required: false
+    default: 'false'
+  flat_naming:
+    description: 'Use flat naming convention (true/false). If true, expects files like locales/en.json instead of locales/en/file.json'
+    required: false
+    default: 'false'
+  skip_include_tags:
+    description: 'Skip setting the include-tags argument during download. This will download all translation keys for the specified format, regardless of tags.'
+    required: false
+    default: 'false'
+  skip_original_filenames:
+    description: "Skips setting the --original-filenames and --directory-prefix arguments during download. By default, the action enables --original-filenames=true and sets a directory-prefix to /. When --original-filenames is set to false, all translation keys are exported into a single file per language, and --directory-prefix has no effect."
+    required: false
+    default: 'false'
+  pr_labels:
+    description: 'Comma-separated list of labels to apply to the created pull request'
+    required: false
+    default: ''
+  pr_title:
+    description: 'Title of the pull request. If not provided, defaults to "Lokalise translations update".'
+    required: false
+    default: 'Lokalise translations update'
+  pr_body:
+    description: 'Body of the pull request. If not provided, defaults to "This PR updates translations from Lokalise."'
+    required: false
+    default: 'This PR updates translations from Lokalise.'
+  pr_reviewers:
+    description: 'Comma-separated list of GitHub usernames to assign as reviewers for the pull request.'
+    required: false
+    default: ''
+  pr_teams_reviewers:
+    description: 'Comma-separated list of team slugs within the organization to assign as reviewers for the pull request.'
+    required: false
+    default: ''
+  pr_draft:
+    description: 'Create PR as draft'
+    required: false
+    default: 'false'
+  pr_assignees:
+    description: 'Comma-separated list of assignees for the PR'
+    required: false
+    default: ''
+  max_retries:
+    description: 'Maximum number of retries on rate limit and other retryable errors'
+    required: false
+    default: '3'
+  sleep_on_retry:
+    description: 'Number of seconds to sleep before retrying'
+    required: false
+    default: '1'
+  http_timeout:
+    description: 'Timeout for HTTP calls (in seconds)'
+    required: false
+    default: '120'
+  download_timeout:
+    description: 'Timeout for the whole download operation (in seconds)'
+    required: false
+    default: '600'
+  async_mode:
+    description: 'Use async mode for translations download'
+    required: false
+    default: 'false'
+  async_poll_initial_wait:
+    description: 'Number of seconds to wait before polling the async download process for the first time'
+    required: false
+    default: '1'
+  async_poll_max_wait:
+    description: 'Timeout for polling the async download process'
+    required: false
+    default: '120'
+  os_platform:
+    description: 'Target platform for the binary (linux_amd64, linux_arm64, mac_amd64, mac_arm64)'
+    required: false
+    default: 'linux_amd64'
+  git_user_name:
+    description: 'Git username to set in git config. If not provided, defaults to GitHub actor.'
+    required: false
+    default: ''
+  git_user_email:
+    description: 'Git email to set in git config. If not provided, uses "<username>@users.noreply.github.com".'
+    required: false
+    default: ''
+  git_commit_message:
+    description: 'Git commit message used. If not provided, defaults to "Translations update".'
+    required: false
+    default: 'Translations update'
+  custom_github_token:
+    description: 'Optional GitHub token to use for API operations instead of the default GITHUB_TOKEN. Useful for custom permissions or elevated scopes.'
+    required: false
+    default: ''
+  override_branch_name:
+    description: 'Optional static branch name to use instead of auto-generating one. Useful when you want to reuse the same PR.'
+    required: false
+    default: ''
+  force_push:
+    description: 'Force push changes to the remote branch (overwrites history). Use with caution. Defaults to false.'
+    required: false
+    default: 'false'
+  post_process_command:
+    description: 'Shell command to run after downloading translation files and before committing. Useful for custom replacements, cleanup, or any post-processing logic. Still experimental.'
+    required: false
+    default: ''
+  post_process_strict:
+    description: 'Whether to fail the action if the post_process_command returns a non-zero exit code'
+    required: false
+    default: 'false'
+
+branding:
+  icon: 'download-cloud'
+  color: 'orange'
+
+outputs:
+  created_branch:
+    description: "Branch used for the PR (new temp branch on manual runs, PR head on PR runs)"
+    value: ${{ steps.create-commit.outputs.branch_name }}
+
+  pr_exists:
+    description: "True if a PR exists after this run (created or updated)"
+    value: ${{ steps.create-update-pr.outputs.pr_exists }}
+
+  pr_created:
+    description: "True if a brand-new PR was created by this run"
+    value: ${{ steps.create-update-pr.outputs.pr_created }}
+
+  pr_updated:
+    description: "True if an existing PR was updated by this run"
+    value: ${{ steps.create-update-pr.outputs.pr_updated }}
+
+  pr_action:
+    description: "Either 'created', 'updated', or 'none'"
+    value: ${{ steps.create-update-pr.outputs.pr_action }}
+
+  pr_number:
+    description: "Pull request number (created or existing)"
+    value: ${{ steps.create-update-pr.outputs.pr_number }}
+
+  pr_id:
+    description: "Pull request ID (created or existing)"
+    value: ${{ steps.create-update-pr.outputs.pr_id }}
+
+  pr_url:
+    description: "Pull request URL (created or existing)"
+    value: ${{ steps.create-update-pr.outputs.pr_url }}
+
+runs:
+  using: "composite"
+  steps:
+    - name: Pull translation files from Lokalise
+      id: pull-files
+      shell: bash
+      env:
+        LOKALISE_API_KEY: "${{ inputs.api_token }}"
+        LOKALISE_PROJECT_ID: "${{ inputs.project_id }}"
+        FILE_EXT: "${{ inputs.file_ext }}"
+        ADDITIONAL_PARAMS: "${{ inputs.additional_params }}"
+        MAX_RETRIES: "${{ inputs.max_retries }}"
+        SLEEP_TIME: "${{ inputs.sleep_on_retry }}"
+        FILE_FORMAT: "${{ inputs.file_format }}"
+        TRANSLATIONS_PATH: "${{ inputs.translations_path }}"
+        BASE_LANG: "${{ inputs.base_lang }}"
+        ALWAYS_PULL_BASE: "${{ inputs.always_pull_base }}"
+        FLAT_NAMING: "${{ inputs.flat_naming }}"
+        HTTP_TIMEOUT: "${{ inputs.http_timeout }}"
+        DOWNLOAD_TIMEOUT: "${{ inputs.download_timeout }}"
+        SKIP_INCLUDE_TAGS: "${{ inputs.skip_include_tags }}"
+        SKIP_ORIGINAL_FILENAMES: "${{ inputs.skip_original_filenames }}"
+        PLATFORM: "${{ inputs.os_platform }}"
+        ASYNC_MODE: "${{ inputs.async_mode }}"
+        ASYNC_POLL_INITIAL_WAIT: "${{ inputs.async_poll_initial_wait }}"
+        ASYNC_POLL_MAX_WAIT: "${{ inputs.async_poll_max_wait }}"
+      run: |
+        set -euo pipefail
+
+        echo "Downloading translation files from Lokalise..."
+        
+        CMD_PATH="${{ github.action_path }}/bin/lokalise_download_${PLATFORM}"
+        if [ ! -f "$CMD_PATH" ]; then
+          echo "Error: Binary for platform '${PLATFORM}' not found!"
+          exit 1
+        fi
+        chmod +x "$CMD_PATH"
+        "$CMD_PATH" || {
+          echo "Error: lokalise_download script failed with exit code $?"
+          exit 1
+        }
+
+        echo "Download complete! Detecting changed files..."
+
+        CMD_PATH="${{ github.action_path }}/bin/detect_changed_files_${PLATFORM}"
+        if [ ! -f "$CMD_PATH" ]; then
+          echo "Error: Binary for platform '${PLATFORM}' not found!"
+          exit 1
+        fi
+        chmod +x "$CMD_PATH"
+        "$CMD_PATH" || {
+          echo "Error: detect_changed_files script failed with exit code $?"
+          exit 1
+        }
+
+    - name: Run post-processing command
+      if: inputs.post_process_command != ''
+      env:
+        FILE_FORMAT: "${{ inputs.file_format }}"
+        FILE_EXT: "${{ inputs.file_ext }}"
+        TRANSLATIONS_PATH: "${{ inputs.translations_path }}"
+        BASE_LANG: "${{ inputs.base_lang }}"
+        FLAT_NAMING: "${{ inputs.flat_naming }}"
+        PLATFORM: "${{ inputs.os_platform }}"
+        STRICT: "${{ inputs.post_process_strict }}"
+        POST_CMD: "${{ inputs.post_process_command }}"
+      shell: bash
+      run: |
+        echo "Running post-process command:"
+        printf '%s\n' "$POST_CMD"
+
+        set +e
+        bash -eo pipefail -lc "$POST_CMD"
+        EXIT_CODE=$?
+        set -e
+
+        if [[ "$STRICT" == "true" && "$EXIT_CODE" -ne 0 ]]; then
+          echo "Post-processing failed with exit code $EXIT_CODE and strict mode is enabled. Exiting."
+          exit "$EXIT_CODE"
+        elif [[ "$EXIT_CODE" -ne 0 ]]; then
+          echo "Post-processing failed with exit code $EXIT_CODE, but strict mode is off. Continuing..."
+        else
+          echo "Post-processing finished successfully."
+        fi
+
+    - name: Commit changes
+      id: create-commit
+      if: steps.pull-files.outputs.has_changes == 'true'
+      env:
+        BASE_REF: "${{ github.event.pull_request.base.ref || github.ref_name }}"
+        HEAD_REF: "${{ github.event.pull_request.head.ref || '' }}"
+        FILE_FORMAT: "${{ inputs.file_format }}"
+        FILE_EXT: "${{ inputs.file_ext }}"
+        TRANSLATIONS_PATH: "${{ inputs.translations_path }}"
+        BASE_LANG: "${{ inputs.base_lang }}"
+        ALWAYS_PULL_BASE: "${{ inputs.always_pull_base }}"
+        FLAT_NAMING: "${{ inputs.flat_naming }}"
+        TEMP_BRANCH_PREFIX: "${{ inputs.temp_branch_prefix }}"
+        PLATFORM: "${{ inputs.os_platform }}"
+        GIT_USER_NAME: "${{ inputs.git_user_name }}"
+        GIT_USER_EMAIL: "${{ inputs.git_user_email }}"
+        GIT_COMMIT_MESSAGE: "${{ inputs.git_commit_message }}"
+        OVERRIDE_BRANCH_NAME: "${{ github.event.pull_request.head.ref || inputs.override_branch_name }}"
+        FORCE_PUSH: "${{ inputs.force_push }}"
+      shell: bash
+      run: |
+        set -euo pipefail
+
+        echo "Committing changes..."
+
+        CMD_PATH="${{ github.action_path }}/bin/commit_changes_${PLATFORM}"
+        if [ ! -f "$CMD_PATH" ]; then
+          echo "Error: Binary for platform '${PLATFORM}' not found!"
+          exit 1
+        fi
+
+        chmod +x "$CMD_PATH"
+        "$CMD_PATH" || {
+          echo "Error: commit_changes script failed with exit code $?"
+          echo "has_changes=false" >> $GITHUB_OUTPUT
+          exit 1
+        }
+
+        echo "Changes have been committed!"
+
+    - name: Create or Update Pull Request
+      if: steps.pull-files.outputs.has_changes == 'true' && steps.create-commit.outputs.commit_created == 'true'
+      env:
+        BRANCH_NAME: "${{ steps.create-commit.outputs.branch_name }}"
+        BASE_REF: "${{ github.event.pull_request.base.ref || github.ref_name }}"
+        PR_LABELS: "${{ inputs.pr_labels }}"
+        PR_TITLE: "${{ inputs.pr_title }}"
+        PR_BODY: "${{ inputs.pr_body }}"
+        PR_TEAMS_REVIEWERS: "${{ inputs.pr_teams_reviewers }}"
+        PR_REVIEWERS: "${{ inputs.pr_reviewers }}"
+        PR_DRAFT: "${{ inputs.pr_draft }}"
+        PR_ASSIGNEES: "${{ inputs.pr_assignees }}"
+      id: create-update-pr
+      # actions/github-script@v8.0.0
+      uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd
+      with:
+        github-token: ${{ inputs.custom_github_token || github.token }}
+        result-encoding: string
+        script: |
+          const path = require('path');
+          const createOrUpdatePR = require(path.join(process.env.GITHUB_ACTION_PATH, 'js/create-update-pr.js'));
+          const result = await createOrUpdatePR({ github, context });
+          const created = !!result.created;
+          const updated = !created && !!result.pr;
+          const exists  = !!result.pr;
+
+          core.setOutput('pr_created', created);
+          core.setOutput('pr_updated', updated);
+          core.setOutput('pr_exists', exists);
+          core.setOutput('pr_number', result.pr?.number || '');
+          core.setOutput('pr_id', result.pr?.id || '');
+          core.setOutput('pr_url', result.pr?.html_url || '');
+
+          const action = created ? 'created' : (updated ? 'updated' : 'none');
+          core.setOutput('pr_action', action);
+
+          return action;
+
+    - name: Verify PR presence
+      id: check-pr-created
+      shell: bash
+      run: |
+        set -e
+
+        if [ "${{ steps.pull-files.outputs.has_changes }}" != "true" ]; then
+          echo "No changes detected, nothing to commit."
+          exit 0
+        fi
+
+        if [ "${{ steps.create-commit.outputs.commit_created }}" != "true" ]; then
+          echo "Changes detected but no commit was created (e.g., filtered/excluded)."
+          exit 0
+        fi
+
+        echo "PR action: ${{ steps.create-update-pr.outputs.pr_action }}"
+        echo "PR number: ${{ steps.create-update-pr.outputs.pr_number }}"
+        echo "PR url:    ${{ steps.create-update-pr.outputs.pr_url }}"
+
+        if [ "${{ steps.create-update-pr.outputs.pr_exists }}" = "true" ]; then
+          if [ "${{ steps.create-update-pr.outputs.pr_created }}" = "true" ]; then
+            echo "PR was created."
+          elif [ "${{ steps.create-update-pr.outputs.pr_updated }}" = "true" ]; then
+            echo "PR was updated."
+          else
+            echo "PR exists, but neither created nor updated flags are true (noop?)."
+          fi
+        else
+          echo "Commit created but no PR exists (unexpected)."
+        fi
