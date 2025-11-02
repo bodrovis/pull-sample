@@ -1,7 +1,10 @@
-name: build-and-release
+name: build-to-bin
+
 on:
-  push:
-    tags: [ "v*.*.*" ]
+  # push:
+  #   branches: [ "**" ]
+  #   paths-ignore:
+  #     - "bin/**"
   workflow_dispatch:
 
 permissions:
@@ -26,7 +29,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v5
-        with: { fetch-depth: 0 }
+        with:
+          fetch-depth: 0
 
       - name: Set up Go
         uses: actions/setup-go@v6
@@ -89,7 +93,7 @@ jobs:
           upx --best --lzma --no-progress \
             -o "${{ matrix.module }}${{ steps.tgt.outputs.SUFFIX }}.upx" \
             "${{ matrix.module }}${{ steps.tgt.outputs.SUFFIX }}"
-
+          # sanity: детерминизм внутри раннера
           upx --best --lzma --no-progress \
             -o "${{ matrix.module }}${{ steps.tgt.outputs.SUFFIX }}.upx2" \
             "${{ matrix.module }}${{ steps.tgt.outputs.SUFFIX }}.orig"
@@ -114,43 +118,55 @@ jobs:
             dist/${{ matrix.module }}${{ steps.tgt.outputs.SUFFIX }}.upx
             dist/${{ matrix.module }}${{ steps.tgt.outputs.SUFFIX }}.upx.sha256
 
-  release:
-    name: publish release
+  commit-bin:
+    name: commit bin/
     runs-on: ubuntu-22.04
     needs: [ build ]
-    if: startsWith(github.ref, 'refs/tags/v')
     steps:
-      - name: Download all artifacts
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: Download all build artifacts
         uses: actions/download-artifact@v5
         with:
-          path: dist_all
+          path: _dist
           merge-multiple: true
 
-      - name: List artifacts
+      - name: Prepare bin directory
         run: |
-          ls -lah dist_all
+          set -euo pipefail
+          rm -rf bin
+          mkdir -p bin
+
+          shopt -s nullglob
+          cp -v _dist/* bin/
+          rm -f bin/*.orig bin/*.upx2
 
       - name: Generate combined checksums.txt
         run: |
-          cd dist_all
-          # считаем хеши только для бинарей (исключаем .sha256 и .upx2/ .orig)
-          find . -type f \
-            ! -name "*.sha256" \
-            ! -name "*.orig" \
-            ! -name "*.upx2" \
-            -exec sha256sum {} \; \
+          set -euo pipefail
+          cd bin
+          rm -f checksums.txt
+          find . -maxdepth 1 -type f ! -name "checksums.txt" -exec sha256sum {} \; \
             | sed 's@\s\+\./@  @' \
+            | sort -k2 \
             > checksums.txt
+          echo "---- checksums.txt ----"
           cat checksums.txt
 
-      - name: Create GitHub Release
-        uses: softprops/action-gh-release@v2
-        with:
-          name: ${{ github.ref_name }}
-          tag_name: ${{ github.ref_name }}
-          draft: false
-          prerelease: ${{ contains(github.ref_name, '-rc') || contains(github.ref_name, '-beta') || contains(github.ref_name, '-alpha') }}
-          files: |
-            dist_all/*
+      - name: Commit bin/ to repo
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A bin
+          if git diff --cached --quiet; then
+            echo "No changes in bin/, skipping commit."
+            exit 0
+          fi
+          git commit -m "ci: update bin artifacts [skip ci]"
+          git push
