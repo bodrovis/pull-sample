@@ -170,3 +170,50 @@ jobs:
           fi
           git commit -m "ci: update bin artifacts [skip ci]"
           git push
+
+  sign-bin:
+    name: sign checksums.txt
+    runs-on: ubuntu-22.04
+    needs: [ commit-bin ]
+    permissions:
+      id-token: write
+      contents: write
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@v4.0.0
+        with:
+          cosign-release: 'v3.0.2'
+
+      - name: Sign bin/checksums.txt (keyless)
+        run: |
+          set -euo pipefail
+          if [ ! -f bin/checksums.txt ]; then
+            echo "bin/checksums.txt not found!"
+            exit 1
+          fi
+          cosign sign-blob \
+            --yes \
+            --output-signature bin/checksums.txt.sig \
+            bin/checksums.txt
+
+          cosign verify-blob \
+            --signature bin/checksums.txt.sig \
+            bin/checksums.txt
+
+      - name: Commit signature
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add bin/checksums.txt.sig
+          if git diff --cached --quiet; then
+            echo "No new signature, skipping."
+            exit 0
+          fi
+          git commit -m "ci: sign checksums.txt [skip ci]"
+          git push
