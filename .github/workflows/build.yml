@@ -1,30 +1,32 @@
-name: build
+name: build-and-release
 on:
   push:
-    branches: [ "**" ]
     tags: [ "v*.*.*" ]
   workflow_dispatch:
 
+permissions:
+  contents: write
+  id-token: write
+
 jobs:
   build:
-    name: build (${{ matrix.module }})
+    name: build ${{ matrix.module }} (${{ matrix.target }})
     runs-on: ubuntu-22.04
-
     strategy:
       fail-fast: false
       matrix:
         module: [ commit_changes, detect_changed_files, lokalise_download ]
+        target: [ linux_amd64, linux_arm64, mac_amd64, mac_arm64 ]
 
     env:
+      GOWORK: "off"
       CGO_ENABLED: "0"
       SOURCE_DATE_EPOCH: "1704067200"
-      GOWORK: "off"
 
     steps:
       - name: Checkout
         uses: actions/checkout@v5
-        with:
-          fetch-depth: 0
+        with: { fetch-depth: 0 }
 
       - name: Set up Go
         uses: actions/setup-go@v6
@@ -32,13 +34,23 @@ jobs:
           go-version: "1.25.3"
           check-latest: false
 
-      - name: Go env
-        run: |
-          go version
-          go env
-
-      - name: Build ${{ matrix.module }}
+      - name: Resolve target env
+        id: tgt
         shell: bash
+        run: |
+          case "${{ matrix.target }}" in
+            linux_amd64)  echo "GOOS=linux"  >> $GITHUB_OUTPUT; echo "GOARCH=amd64" >> $GITHUB_OUTPUT; echo "SUFFIX=_linux_amd64"  >> $GITHUB_OUTPUT ;;
+            linux_arm64)  echo "GOOS=linux"  >> $GITHUB_OUTPUT; echo "GOARCH=arm64" >> $GITHUB_OUTPUT; echo "SUFFIX=_linux_arm64"  >> $GITHUB_OUTPUT ;;
+            mac_amd64)    echo "GOOS=darwin" >> $GITHUB_OUTPUT; echo "GOARCH=amd64" >> $GITHUB_OUTPUT; echo "SUFFIX=_mac_amd64"   >> $GITHUB_OUTPUT ;;
+            mac_arm64)    echo "GOOS=darwin" >> $GITHUB_OUTPUT; echo "GOARCH=arm64" >> $GITHUB_OUTPUT; echo "SUFFIX=_mac_arm64"   >> $GITHUB_OUTPUT ;;
+            *) echo "unknown target"; exit 1 ;;
+          esac
+
+      - name: Build → dist/${{ matrix.module }}${{ steps.tgt.outputs.SUFFIX }}
+        shell: bash
+        env:
+          GOOS: ${{ steps.tgt.outputs.GOOS }}
+          GOARCH: ${{ steps.tgt.outputs.GOARCH }}
         run: |
           set -euo pipefail
           mkdir -p dist
@@ -49,19 +61,96 @@ jobs:
             -buildvcs=false \
             -mod=vendor \
             -ldflags "-buildid=" \
-            -o "../../dist/${{ matrix.module }}" \
+            -o "../../dist/${{ matrix.module }}${{ steps.tgt.outputs.SUFFIX }}" \
             .
 
-      - name: Checksums
+      - name: SHA256 (raw)
         run: |
           cd dist
-          sha256sum "${{ matrix.module }}" > "${{ matrix.module }}.sha256"
-          cat "${{ matrix.module }}.sha256"
+          sha256sum "${{ matrix.module }}${{ steps.tgt.outputs.SUFFIX }}" > "${{ matrix.module }}${{ steps.tgt.outputs.SUFFIX }}.sha256"
+          cat "${{ matrix.module }}${{ steps.tgt.outputs.SUFFIX }}.sha256"
 
-      - name: Upload artifact (${{ matrix.module }})
+      - name: Install UPX 5.0.2
+        if: startsWith(matrix.target, 'linux_')
+        run: |
+          set -euo pipefail
+          ver="5.0.2"
+          curl -sSL -o upx.tar.xz "https://github.com/upx/upx/releases/download/v${ver}/upx-${ver}-amd64_linux.tar.xz"
+          tar -xJf upx.tar.xz
+          sudo install -m 0755 "upx-${ver}-amd64_linux/upx" /usr/local/bin/upx
+          upx --version
+
+      - name: UPX pack (linux only)
+        if: startsWith(matrix.target, 'linux_')
+        run: |
+          set -euo pipefail
+          cd dist
+          cp "${{ matrix.module }}${{ steps.tgt.outputs.SUFFIX }}" "${{ matrix.module }}${{ steps.tgt.outputs.SUFFIX }}.orig"
+          upx --best --lzma --no-progress \
+            -o "${{ matrix.module }}${{ steps.tgt.outputs.SUFFIX }}.upx" \
+            "${{ matrix.module }}${{ steps.tgt.outputs.SUFFIX }}"
+
+          upx --best --lzma --no-progress \
+            -o "${{ matrix.module }}${{ steps.tgt.outputs.SUFFIX }}.upx2" \
+            "${{ matrix.module }}${{ steps.tgt.outputs.SUFFIX }}.orig"
+          diff -q "${{ matrix.module }}${{ steps.tgt.outputs.SUFFIX }}.upx" "${{ matrix.module }}${{ steps.tgt.outputs.SUFFIX }}.upx2"
+          sha256sum "${{ matrix.module }}${{ steps.tgt.outputs.SUFFIX }}.upx" > "${{ matrix.module }}${{ steps.tgt.outputs.SUFFIX }}.upx.sha256"
+          cat "${{ matrix.module }}${{ steps.tgt.outputs.SUFFIX }}.upx.sha256"
+
+      - name: Upload artifact (raw)
         uses: actions/upload-artifact@v5
         with:
-          name: ${{ matrix.module }}
+          name: ${{ matrix.module }}${{ steps.tgt.outputs.SUFFIX }}
           path: |
-            dist/${{ matrix.module }}
-            dist/${{ matrix.module }}.sha256
+            dist/${{ matrix.module }}${{ steps.tgt.outputs.SUFFIX }}
+            dist/${{ matrix.module }}${{ steps.tgt.outputs.SUFFIX }}.sha256
+
+      - name: Upload artifact (upx)
+        if: startsWith(matrix.target, 'linux_')
+        uses: actions/upload-artifact@v5
+        with:
+          name: ${{ matrix.module }}${{ steps.tgt.outputs.SUFFIX }}-upx
+          path: |
+            dist/${{ matrix.module }}${{ steps.tgt.outputs.SUFFIX }}.upx
+            dist/${{ matrix.module }}${{ steps.tgt.outputs.SUFFIX }}.upx.sha256
+
+  release:
+    name: publish release
+    runs-on: ubuntu-22.04
+    needs: [ build ]
+    if: startsWith(github.ref, 'refs/tags/v')
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v5
+        with:
+          path: dist_all
+          merge-multiple: true
+
+      - name: List artifacts
+        run: |
+          ls -lah dist_all
+
+      - name: Generate combined checksums.txt
+        run: |
+          cd dist_all
+          # считаем хеши только для бинарей (исключаем .sha256 и .upx2/ .orig)
+          find . -type f \
+            ! -name "*.sha256" \
+            ! -name "*.orig" \
+            ! -name "*.upx2" \
+            -exec sha256sum {} \; \
+            | sed 's@\s\+\./@  @' \
+            > checksums.txt
+          cat checksums.txt
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: ${{ github.ref_name }}
+          tag_name: ${{ github.ref_name }}
+          draft: false
+          prerelease: ${{ contains(github.ref_name, '-rc') || contains(github.ref_name, '-beta') || contains(github.ref_name, '-alpha') }}
+          files: |
+            dist_all/*
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
