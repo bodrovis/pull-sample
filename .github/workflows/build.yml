@@ -37,6 +37,7 @@ jobs:
         with:
           go-version: "1.25.3"
           check-latest: false
+          cache: true
 
       - name: Resolve target env
         id: tgt
@@ -68,12 +69,7 @@ jobs:
             -o "../../dist/${{ matrix.module }}${{ steps.tgt.outputs.SUFFIX }}" \
             .
 
-      - name: SHA256 (raw)
-        run: |
-          cd dist
-          sha256sum "${{ matrix.module }}${{ steps.tgt.outputs.SUFFIX }}" > "${{ matrix.module }}${{ steps.tgt.outputs.SUFFIX }}.sha256"
-          cat "${{ matrix.module }}${{ steps.tgt.outputs.SUFFIX }}.sha256"
-
+      # --- UPX install & in-place pack (linux only) ---
       - name: Install UPX 5.0.2
         if: startsWith(matrix.target, 'linux_')
         run: |
@@ -84,39 +80,47 @@ jobs:
           sudo install -m 0755 "upx-${ver}-amd64_linux/upx" /usr/local/bin/upx
           upx --version
 
-      - name: UPX pack (linux only)
+      - name: UPX pack in-place (linux only)
         if: startsWith(matrix.target, 'linux_')
         run: |
           set -euo pipefail
           cd dist
-          cp "${{ matrix.module }}${{ steps.tgt.outputs.SUFFIX }}" "${{ matrix.module }}${{ steps.tgt.outputs.SUFFIX }}.orig"
-          upx --best --lzma --no-progress \
-            -o "${{ matrix.module }}${{ steps.tgt.outputs.SUFFIX }}.upx" \
-            "${{ matrix.module }}${{ steps.tgt.outputs.SUFFIX }}"
-          # sanity: детерминизм внутри раннера
-          upx --best --lzma --no-progress \
-            -o "${{ matrix.module }}${{ steps.tgt.outputs.SUFFIX }}.upx2" \
-            "${{ matrix.module }}${{ steps.tgt.outputs.SUFFIX }}.orig"
-          diff -q "${{ matrix.module }}${{ steps.tgt.outputs.SUFFIX }}.upx" "${{ matrix.module }}${{ steps.tgt.outputs.SUFFIX }}.upx2"
-          sha256sum "${{ matrix.module }}${{ steps.tgt.outputs.SUFFIX }}.upx" > "${{ matrix.module }}${{ steps.tgt.outputs.SUFFIX }}.upx.sha256"
-          cat "${{ matrix.module }}${{ steps.tgt.outputs.SUFFIX }}.upx.sha256"
+          upx --best --lzma --no-progress "${{ matrix.module }}${{ steps.tgt.outputs.SUFFIX }}"
+          # sanity: тест распаковки внутри upx
+          upx -t "${{ matrix.module }}${{ steps.tgt.outputs.SUFFIX }}"
 
-      - name: Upload artifact (raw)
+      # --- Sanity checks (no execution) ---
+      - name: Binary sanity checks (metadata)
+        run: |
+          set -euo pipefail
+          cd dist
+          BIN="${{ matrix.module }}${{ steps.tgt.outputs.SUFFIX }}"
+          echo "== file =="
+          file "$BIN" || true
+          echo "== size (bytes) =="
+          wc -c "$BIN"
+          if [[ "${{ matrix.target }}" == linux_* ]]; then
+            echo "== ldd (expect 'not a dynamic executable') =="
+            ldd "$BIN" || true
+          fi
+          echo "== go version -m =="
+          go version -m "$BIN" || true
+
+      # --- SHA256 after finalization (post-UPX for linux) ---
+      - name: SHA256 (final)
+        run: |
+          set -euo pipefail
+          cd dist
+          sha256sum "${{ matrix.module }}${{ steps.tgt.outputs.SUFFIX }}" > "${{ matrix.module }}${{ steps.tgt.outputs.SUFFIX }}.sha256"
+          cat "${{ matrix.module }}${{ steps.tgt.outputs.SUFFIX }}.sha256"
+
+      - name: Upload artifact (final binaries)
         uses: actions/upload-artifact@v5
         with:
           name: ${{ matrix.module }}${{ steps.tgt.outputs.SUFFIX }}
           path: |
             dist/${{ matrix.module }}${{ steps.tgt.outputs.SUFFIX }}
             dist/${{ matrix.module }}${{ steps.tgt.outputs.SUFFIX }}.sha256
-
-      - name: Upload artifact (upx)
-        if: startsWith(matrix.target, 'linux_')
-        uses: actions/upload-artifact@v5
-        with:
-          name: ${{ matrix.module }}${{ steps.tgt.outputs.SUFFIX }}-upx
-          path: |
-            dist/${{ matrix.module }}${{ steps.tgt.outputs.SUFFIX }}.upx
-            dist/${{ matrix.module }}${{ steps.tgt.outputs.SUFFIX }}.upx.sha256
 
   commit-bin:
     name: commit bin/
@@ -142,7 +146,8 @@ jobs:
 
           shopt -s nullglob
           cp -v _dist/* bin/
-          rm -f bin/*.orig bin/*.upx2
+          # на всякий, если где-то всплывёт мусор
+          rm -f bin/*.orig bin/*.upx bin/*.upx2
 
       - name: Generate combined checksums.txt
         run: |
@@ -155,6 +160,12 @@ jobs:
             > checksums.txt
           echo "---- checksums.txt ----"
           cat checksums.txt
+
+      - name: Verify checksums.txt locally
+        run: |
+          set -euo pipefail
+          cd bin
+          sha256sum -c checksums.txt
 
       - name: Commit bin/ to repo
         env:
@@ -240,3 +251,49 @@ jobs:
           fi
           git commit -m "ci: sign checksums.txt (sigstore bundle) [skip ci]"
           git push
+
+  sbom-and-attest:
+    name: SBOM + attest
+    runs-on: ubuntu-22.04
+    needs: [ commit-bin ]
+    permissions:
+      id-token: write
+      contents: write
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: Install syft
+        uses: anchore/sbom-action/download-syft@v0.20.9
+
+      - name: Generate SBOM (SPDX JSON)
+        run: |
+          set -euo pipefail
+          syft packages dir:bin -o spdx-json=bin/sbom.spdx.json || syft scan dir:bin -o spdx-json=bin/sbom.spdx.json
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add bin/sbom.spdx.json
+          git commit -m "ci: add SBOM for bin [skip ci]" || true
+          git push || true
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@v4.0.0
+        with:
+          cosign-release: 'v3.0.2'
+
+      - name: Attest checksums.txt (provenance)
+        run: |
+          set -euo pipefail
+          cosign attest \
+            --yes \
+            --predicate-type https://slsa.dev/provenance/v1 \
+            --predicate <(printf '{"buildType":"github-actions","materials":[{"uri":"git+%s","digest":{"sha1":"%s"}}]}' \
+              "$(git config --get remote.origin.url)" "$(git rev-parse HEAD)") \
+            --bundle bin/checksums.txt.attestation \
+            bin/checksums.txt
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add bin/checksums.txt.attestation
+          git commit -m "ci: add attestation for checksums.txt [skip ci]" || true
+          git push || true
