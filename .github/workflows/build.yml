@@ -191,7 +191,6 @@ jobs:
         run: |
           set -euo pipefail
           BRANCH="${GITHUB_REF#refs/heads/}"
-          # если это пуш в ветку — подтягиваем её последний коммит
           if [ -n "$BRANCH" ] && [ "$GITHUB_REF" != "$BRANCH" ]; then
             git fetch --no-tags origin "$BRANCH"
             git checkout -B "$BRANCH" "origin/$BRANCH"
@@ -204,19 +203,29 @@ jobs:
         with:
           cosign-release: 'v3.0.2'
 
+      - name: Compute expected identity
+        id: ident
+        run: |
+          echo "IDENTITY=https://github.com/${{ github.workflow_ref }}" >> $GITHUB_ENV
+          echo "ISSUER=https://token.actions.githubusercontent.com" >> $GITHUB_ENV
+          echo "expect IDENTITY=$IDENTITY"
+          echo "expect ISSUER=$ISSUER"
+
       - name: Sign bin/checksums.txt (keyless, bundle)
         run: |
           set -euo pipefail
           test -f bin/checksums.txt || { echo "bin/checksums.txt not found"; exit 1; }
-
-          # cosign v2: пишем всё в bundle (подпись+сертификат+цепочка)
           cosign sign-blob --yes \
             --bundle bin/checksums.txt.sigstore \
             bin/checksums.txt
 
-          # верификация тоже через bundle
+      - name: Verify signature (keyless with identity+issuer)
+        run: |
+          set -euo pipefail
           cosign verify-blob \
             --bundle bin/checksums.txt.sigstore \
+            --certificate-identity "$IDENTITY" \
+            --certificate-oidc-issuer "$ISSUER" \
             bin/checksums.txt
 
       - name: Commit signature bundle
