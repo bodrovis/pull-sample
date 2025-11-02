@@ -282,16 +282,49 @@ jobs:
         with:
           cosign-release: 'v3.0.2'
 
-      - name: Attest checksums.txt (provenance)
+      - name: Compute expected identity
+        run: |
+          echo "IDENTITY=https://github.com/${{ github.workflow_ref }}" >> $GITHUB_ENV
+          echo "ISSUER=https://token.actions.githubusercontent.com" >> $GITHUB_ENV
+          echo "expect IDENTITY=$IDENTITY"
+          echo "expect ISSUER=$ISSUER"
+
+      - name: Build attestation predicate (custom)
         run: |
           set -euo pipefail
-          cosign attest \
+          cat > bin/checksums.predicate.json <<'JSON'
+          {
+            "buildType": "github-actions",
+            "materials": [
+              { "uri": "${{ github.server_url }}/${{ github.repository }}", "digest": { "git": "${{ github.sha }}" } }
+            ]
+          }
+          JSON
+          ls -l bin/checksums.predicate.json
+
+      - name: Attest checksums.txt (blob, bundle)
+        env:
+          COSIGN_EXPERIMENTAL: "1"
+        run: |
+          set -euo pipefail
+          test -f bin/checksums.txt
+          cosign attest-blob \
             --yes \
-            --predicate-type https://slsa.dev/provenance/v1 \
-            --predicate <(printf '{"buildType":"github-actions","materials":[{"uri":"git+%s","digest":{"sha1":"%s"}}]}' \
-              "$(git config --get remote.origin.url)" "$(git rev-parse HEAD)") \
+            --type custom \
+            --predicate bin/checksums.predicate.json \
             --bundle bin/checksums.txt.attestation \
             bin/checksums.txt
+
+      - name: Verify blob attestation (identity+issuer)
+        run: |
+          set -euo pipefail
+          cosign verify-blob-attestation \
+            --bundle bin/checksums.txt.attestation \
+            --certificate-identity "$IDENTITY" \
+            --certificate-oidc-issuer "$ISSUER" \
+            --type custom \
+            bin/checksums.txt
+          echo "Blob attestation verified."
           git config user.name  "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add bin/checksums.txt.attestation
